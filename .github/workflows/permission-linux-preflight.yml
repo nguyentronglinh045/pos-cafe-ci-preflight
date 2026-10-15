@@ -1,0 +1,81 @@
+name: Permission Linux CI-0
+
+"on":
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: permission-linux-ci0
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'nguyentronglinh045/pos-cafe-ci-preflight' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Resource and ephemeral namespace preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'scope=CI0_ONLY\nrepository=%s\nref=%s\nsha=%s\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_SHA"
+          printf 'imageOS=%s\nimageVersion=%s\n' \
+            "${ImageOS:-UNKNOWN}" "${ImageVersion:-UNKNOWN}"
+          uname -sr
+          printf 'cpu=%s\n' "$(nproc)"
+          awk '/^MemTotal:|^MemAvailable:/ { print $1, $2, $3 }' /proc/meminfo
+          printf 'cgroupFS=%s\n' "$(stat -f -c %T /sys/fs/cgroup)"
+
+          missing_tools=0
+          for tool in git node python3 docker dockerd containerd unshare; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              "$tool" --version
+            else
+              printf '%s=UNAVAILABLE\n' "$tool"
+              missing_tools=1
+            fi
+          done
+          if (( missing_tools != 0 )); then
+            echo 'CI0_BLOCKED_REQUIRED_TOOL'
+            exit 1
+          fi
+
+          reserve=$((30 * 1024 * 1024 * 1024))
+          check_reserve() {
+            root_free=$(df -PB1 / | awk 'NR == 2 { print $4 }')
+            temp_free=$(df -PB1 "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')
+            printf '%s.rootAvailableBytes=%s\n' "$1" "$root_free"
+            printf '%s.tempAvailableBytes=%s\n' "$1" "$temp_free"
+            if (( root_free < reserve || temp_free < reserve )); then
+              echo 'CI0_BLOCKED_DISK_RESERVE_30_GIB'
+              return 1
+            fi
+          }
+          check_reserve before
+
+          sudo -n true
+          sudo -n timeout -k 2s 15s \
+            unshare --mount --net --pid --fork --kill-child --mount-proc \
+            /bin/bash --noprofile --norc -euo pipefail -c '
+              test "$(readlink /proc/self/ns/mnt)" != "$1"
+              test "$(readlink /proc/self/ns/net)" != "$2"
+              test "$(readlink /proc/self/ns/pid)" != "$3"
+              test "$$" -eq 1
+              mount --make-rprivate /
+              test "$(ip -o link show | wc -l)" -eq 1
+              ip link set lo up
+              ip -o link show dev lo | grep -q UP
+              echo CI0_NAMESPACE_PROBE_PASS
+            ' ci0 \
+            "$(readlink /proc/self/ns/mnt)" \
+            "$(readlink /proc/self/ns/net)" \
+            "$(readlink /proc/self/ns/pid)"
+
+          check_reserve after
+          echo 'CI0_PREFLIGHT_PASS_FULL_STACK_NOT_RUN'
